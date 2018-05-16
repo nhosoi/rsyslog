@@ -40,6 +40,7 @@
 #include "syslogd-types.h"
 #include "template.h"
 #include "module-template.h"
+#include "msg.h"
 #include "errmsg.h"
 #include "cfsysline.h"
 #include "parserif.h"
@@ -63,6 +64,9 @@ typedef struct _instanceData {
 	char *cookie;
 	uchar *container;
 	int lenCookie;
+	sbool bCompact;        /* Skip object if the value is null */
+	char *messageField;    /* Specify field name which value is escaped json string */
+	char *altMessageField; /* Specify alt field name the escaped json string value to be held with */
 	/* REMOVE dummy when real data items are to be added! */
 } instanceData;
 
@@ -82,7 +86,10 @@ static modConfData_t *runModConf = NULL;/* modConf ptr to use for the current ex
 static struct cnfparamdescr actpdescr[] = {
 	{ "cookie", eCmdHdlrString, 0 },
 	{ "container", eCmdHdlrString, 0 },
-	{ "userawmsg", eCmdHdlrBinary, 0 }
+	{ "userawmsg", eCmdHdlrBinary, 0 },
+	{ "compact", eCmdHdlrBinary, 0 },
+	{ "message_field", eCmdHdlrString, 0 },
+	{ "alt_message_field", eCmdHdlrString, 0 }
 };
 static struct cnfparamblk actpblk =
 	{ CNFPARAMBLK_VERSION,
@@ -121,6 +128,8 @@ CODESTARTcreateInstance
 	CHKmalloc(pData->container = (uchar*)strdup("!"));
 	CHKmalloc(pData->cookie = strdup(CONST_CEE_COOKIE));
 	pData->lenCookie = CONST_LEN_CEE_COOKIE;
+	pData->messageField = NULL;
+	pData->altMessageField = NULL;
 finalize_it:
 ENDcreateInstance
 
@@ -145,6 +154,8 @@ BEGINfreeInstance
 CODESTARTfreeInstance
 	free(pData->cookie);
 	free(pData->container);
+	free(pData->messageField);
+	free(pData->altMessageField);
 ENDfreeInstance
 
 BEGINfreeWrkrInstance
@@ -170,6 +181,7 @@ processJSON(wrkrInstanceData_t *pWrkrData, smsg_t *pMsg, char *buf, size_t lenBu
 {
 	struct json_object *json;
 	const char *errMsg;
+	char *ostrcopy = NULL;
 	DEFiRet;
 
 	assert(pWrkrData->tokener != NULL);
@@ -205,9 +217,110 @@ processJSON(wrkrInstanceData_t *pWrkrData, smsg_t *pMsg, char *buf, size_t lenBu
 		}
 		ABORT_FINALIZE(RS_RET_NO_CEE_MSG);
 	}
- 
- 	msgAddJSON(pMsg, pWrkrData->pData->container, json, 0, 0);
+	/*
+	 * mmjsonparse extension
+	 *
+	 * The following code allows action(type="mmjsonparse") to have parameters
+	 *   message_field, alt_message_field and compact.
+	 *
+	 * [example config]
+	 *  action(type="mmjsonparse" cookie="" message_field="log" container="$!parsed" 
+	 *         alt_message_field="original_raw_json" compact="on")
+	 *  With this configuration, 
+	 *  1) if the json object contains key:value pair where key is message_field value
+	 *     and value is a string type:
+	 *     "log":"{\"message\":\"Test message\"}", 
+	 *     "message":"Test message" is going to be added to the top level json with 
+	 *     "original_raw_json":"{\"message\":\"Test message\"}".
+	 *  2) if the json object contains key:value pair where key is message_field value
+	 *     and value is a json object:
+	 *     "log":{"message":"Test message"}, 
+	 *     "message":"Test message" is going to be added to the top level json with 
+	 *     "original_raw_json":"{\"message\":\"Test message\"}".
+	 *
+	 *  By setting compact="on", if the json contains string, array or json object
+	 *  type object which is empty, they are eliminated.
+	 */
+	if (NULL != pWrkrData->pData->messageField) { /* message_field is configured? */
+		struct json_object *sub_json;
+		if (json_object_object_get_ex(json, pWrkrData->pData->messageField, &sub_json)) {
+			/* the message_field ("log" in this example) exists in the given json */
+			if (json_object_is_type(sub_json, json_type_string)) {
+				/* the value is a string type */
+				char *ostr = (char *)json_object_to_json_string_ext(sub_json, JSON_C_TO_STRING_PLAIN);
+				if (NULL == ostr) {
+					DBGPRINTF("mmjsonparse: Error getting the string format value of key '%s' in '%s' failed\n",
+						pWrkrData->pData->messageField, buf);
+					json_object_put(json);
+					ABORT_FINALIZE(RS_RET_JSON_PARSE_ERR);
+				}
+				char *oscp = NULL;
+				int osclen = strlen(ostr);
+				if ('"' == ostr[0]) {
+					oscp = ostr + 1;
+					if ('"' == ostr[osclen-1]) {
+						ostr[osclen-1] = '\0';
+					}
+				} else {
+					oscp = ostr;
+				}
+				ostrcopy = strdup(oscp);
+				if (NULL == ostrcopy) {
+					DBGPRINTF("mmjsonparse: Error duplicating '%s' of '%s' failed\n", oscp, buf);
+					json_object_put(json);
+					ABORT_FINALIZE(RS_RET_JSON_PARSE_ERR);
+				}
+				osclen = strlen(ostrcopy);
+				/* 
+				 * Turning the string into a string format json object.  E.g.,
+				 * {\"message\":\"Test message \",\"log_level\":\"INFO\"}
+				 * ==>
+				 * {"message":"Test message ","log_level":"INFO"}
+				 */
+				unescapeStr((uchar *)ostrcopy, osclen + 1);
+				struct json_object *const nestedjson = json_tokener_parse_ex(pWrkrData->tokener, ostrcopy, osclen);
+				if (NULL != nestedjson) {
+					/* Deleting orgnestedjson */
+					json_object_object_del(json, pWrkrData->pData->messageField);
+					CHKiRet(jsonMerge(json, nestedjson));
+				}
+				/* 
+				 * Else case: (NULL == nestedjson) means the value of messageField is pure string, 
+				 * e.g., {"log":"string"}.  Leave it as is.
+				 */
+			} else if (json_object_is_type(sub_json, json_type_object)) {
+				/* the value is a json object */
+				json_object_get(sub_json); /* do not free sub_json in the next json_object_object_del */
+				if (NULL != pWrkrData->pData->altMessageField) {
+					/* convert the object to the string format before consumed in jsonMerge */
+					ostrcopy = (char *)json_object_to_json_string_ext(sub_json, JSON_C_TO_STRING_PLAIN);
+				}
+				json_object_object_del(json, pWrkrData->pData->messageField);
+				CHKiRet(jsonMerge(json, sub_json));
+			}
+		}
+	}
+	/* Eliminating empty json objects */
+	if (pWrkrData->pData->bCompact) {
+		int rc = jsonCompact(json);
+		if ((rc < 0) /*error*/ || (rc > 0) /*empty*/) {
+			json_object_put(json); 
+			json = NULL;
+		}
+	}	
+	if (NULL != json) {
+		/*
+		 * Check if alt_message_field is specified in rsyslog.conf
+		 * action(type="mmjsonparse" cookie="" message_field="log" alt_message_field="original_message")
+		 * Note: if message_field is not given, alt_message_field is ignored.
+		 */
+		if ((NULL != pWrkrData->pData->altMessageField) && (NULL != ostrcopy)) {
+			json_object_object_add(json, pWrkrData->pData->altMessageField, json_object_new_string(ostrcopy));
+		}
+ 		msgAddJSON(pMsg, pWrkrData->pData->container, json, 0, 0);
+	}
 finalize_it:
+	free(ostrcopy);
 	RETiRet;
 }
 
@@ -258,6 +371,7 @@ static inline void
 setInstParamDefaults(instanceData *pData)
 {
 	pData->bUseRawMsg = 0;
+	pData->bCompact = 0;
 }
 
 BEGINnewActInst
@@ -306,6 +420,14 @@ CODESTARTnewActInst
 		}
 		} else if(!strcmp(actpblk.descr[i].name, "userawmsg")) {
 			pData->bUseRawMsg = (int) pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "compact")) {
+			pData->bCompact = (int) pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "message_field")) {
+			free(pData->messageField);
+			pData->messageField = es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(actpblk.descr[i].name, "alt_message_field")) {
+			free(pData->altMessageField);
+			pData->altMessageField = es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else {
 			dbgprintf("mmjsonparse: program error, non-handled param '%s'\n", actpblk.descr[i].name);
 		}
