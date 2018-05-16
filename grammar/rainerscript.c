@@ -1928,7 +1928,10 @@ doFunc_parse_json_ex(struct cnffunc *__restrict__ const func,
 				 * Once implemented, we may want to replace with it.
 				 */
 				/* nestedjson is going to be consumed. */
-				json_object_object_merge(json, nestedjson, 0);
+				if (0 != json_object_object_merge(json, nestedjson, 0)) {
+					retVal = RS_SCRIPT_EINVAL;
+					goto bail;
+				}
 			}
 		}
 		if ((strlen(origkey) > 0) && (NULL != ostrcopy)) {
