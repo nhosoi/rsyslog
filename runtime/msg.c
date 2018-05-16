@@ -4767,7 +4767,7 @@ finalize_it:
 	RETiRet;
 }
 
-static rsRetVal
+rsRetVal
 jsonMerge(struct json_object *existing, struct json_object *json)
 {
 	/* TODO: check & handle duplicate names */
@@ -4814,6 +4814,80 @@ jsonFind(struct json_object *jroot, msgPropDescr_t *pProp, struct json_object **
 
 finalize_it:
 	RETiRet;
+}
+
+/* 
+ * Deleting empty json values.  Applicable to string, array, and json object type.
+ * [example]
+ * input:
+ *   {"message":"Test message","log_level":"INFO","field0":"","field1":[],"field2":{}}
+ * output:
+ *   {"message":"Test message","log_level":"INFO"}
+ *
+ * Return value:   1 - compacted (or null/empty)
+ *                 0 - not compacted success
+ *               < 0 - error
+ */
+int
+jsonCompact(struct json_object *__restrict__ json)
+{
+	int rc = 0;
+	int i;
+
+	if(json == NULL) {
+		rc = 1;
+		goto finalize_it;
+	}
+
+	struct json_object_iterator it = json_object_iter_begin(json);
+	struct json_object_iterator itEnd = json_object_iter_end(json);
+	for (i = 0; !json_object_iter_equal(&it, &itEnd); i++) {
+		struct json_object *val = json_object_iter_peek_value(&it);
+		switch (json_object_get_type(val)) {
+		case json_type_string:
+			if (0 == json_object_get_string_len(val)) {
+				json_object_object_del(json, json_object_iter_peek_name(&it));	
+				rc = 1;
+			}
+			break;
+		case json_type_array:
+		{
+			int arrayLen = json_object_array_length(val);
+			int j;
+			if (0 == arrayLen) {
+				json_object_object_del(json, json_object_iter_peek_name(&it));	
+			}
+			for (j = 0 ; j < arrayLen ; ++j) {
+				struct json_object *subjson = json_object_array_get_idx(val, j);
+				rc = jsonCompact(subjson);
+				if (rc > 0) {
+					/* delete the empty item and reset the index and arrayLen */
+					arrayLen = json_object_array_length(val);
+					json_object_array_del_idx(val, j--);
+				} else if (rc < 0) {
+					goto finalize_it;
+				}
+			}
+			break;
+		}
+		case json_type_object:
+			if (0 == json_object_object_length(val)) {
+				json_object_object_del(json, json_object_iter_peek_name(&it));	
+				rc = 1;
+			} else {
+				jsonCompact(val);
+			}
+			break;
+		default: break;
+		}
+		json_object_iter_next(&it);
+	}
+	if (0 == i) {
+		/* Json is empty.  Since size is 0, return 1 */
+		rc = 1;
+	}
+finalize_it:
+	return rc;
 }
 
 rsRetVal
