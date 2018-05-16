@@ -1809,6 +1809,168 @@ finalize_it:
 	varFreeMembers(&srcVal[1]);
 }
 
+/*
+ * parse_json extension 
+ *
+ * Usage
+ *   set $.ret = parse_json_ex(json_string_to_parse, container, nested_message_key, 
+ *                             key_for_holding_original_nested_message_value, 
+ *                             boolean_to_specify_compact_or_not);
+ *
+ * Purpose
+ *   There is some log collector that sends a nested message to rsyslog, in which 
+ *   a string format message is nested with a well known name, e.g., "log".
+ *     {"log":"{\"message\":\"Test message\",\"log_level\":\"INFO\"}","stream":"stdin",
+ *      "time":"2018-06-03T17:43:26.653959-06:00","extra":[]}
+ *   This json is suppoed to get converted to 
+ *     {"original_raw_json":"{\"message\":\"Test message\",\"log_level\":\"INFO\"}", 
+ *      "message":"Test message","log_level":"INFO","stream":"stdin",
+ *      "time":"2018-06-03T17:43:26.653959-06:00","extra":[]}
+ *   This conversion is done by:
+ *     set $.ret = parse_json_ex($msg, "\$!parsed", "log", "original_raw_json", "false");
+ *
+ *   If the original raw json is not needed:
+ *     set $.ret = parse_json_ex($msg, "\$!parsed", "log", "", "false");
+ *
+ *   To drop empty json (applicable to string type, array type, json object type) 
+ *     set $.ret = parse_json_ex($msg, "\$!parsed", "log", "", "true");
+ *   Result:
+ *     {"message":"Test message","log_level":"INFO","stream": "stdin",
+ *      "time":"2018-06-03T17:43:26.653959-06:00"}
+ */
+static void ATTR_NONNULL()
+doFunc_parse_json_ex(struct cnffunc *__restrict__ const func,
+	struct svar *__restrict__ const ret,
+	void *const usrptr,
+	wti_t *const pWti)
+{
+	struct svar srcVal[5];
+	int bMustFree;
+	int bMustFree2;
+	int bMustFree3;
+	int bMustFree4;
+	int bMustFree5;
+	smsg_t *const pMsg = (smsg_t*)usrptr;
+	cnfexprEval(func->expr[0], &srcVal[0], usrptr, pWti);
+	cnfexprEval(func->expr[1], &srcVal[1], usrptr, pWti);
+	cnfexprEval(func->expr[2], &srcVal[2], usrptr, pWti);
+	cnfexprEval(func->expr[3], &srcVal[3], usrptr, pWti);
+	cnfexprEval(func->expr[4], &srcVal[4], usrptr, pWti);
+	char *jsontext = (char*) var2CString(&srcVal[0], &bMustFree);
+	char *container = (char*) var2CString(&srcVal[1], &bMustFree2);
+	char *nestedkey = (char*) var2CString(&srcVal[2], &bMustFree3);
+	/* key to hold the orignal value of nestedkey, e.g., "original_raw_json" */
+	char *origkey = (char*) var2CString(&srcVal[3], &bMustFree4); 
+	char *compact = (char*) var2CString(&srcVal[4], &bMustFree5); 
+	char *ostrcopy = NULL;
+	int retVal;
+	assert(jsontext != NULL);
+	assert(container != NULL);
+	assert(nestedkey != NULL);
+	assert(origkey != NULL);
+	assert(compact != NULL);
+	assert(pMsg != NULL);
+
+	struct json_tokener *const tokener = json_tokener_new();
+	if(tokener == NULL) {
+		retVal = 1;
+		goto finalize_it;
+	}
+	struct json_object *const json = json_tokener_parse_ex(tokener, jsontext, strlen(jsontext));
+	if(json == NULL) {
+		retVal = RS_SCRIPT_EINVAL;
+	} else {
+		size_t off = (*container == '$') ? 1 : 0;
+		struct json_object *orgnestedjson = NULL;
+
+		if (strlen(nestedkey) > 0) {
+			if (json_object_object_get_ex(json, nestedkey, &orgnestedjson) &&
+			    (NULL != orgnestedjson) && json_object_is_type(orgnestedjson, json_type_string)) {
+				/* ok to cast to (char *) since the subjson is going to be deleted. */
+				char *ostr = (char *)json_object_to_json_string_ext(orgnestedjson, JSON_C_TO_STRING_PLAIN);
+				if (NULL == ostr) {
+					retVal = RS_SCRIPT_EINVAL;
+					goto bail;
+				}
+				char *oscp = NULL;
+				int osclen = strlen(ostr);
+				if ('"' == ostr[0]) {
+					oscp = ostr + 1;
+					if ('"' == ostr[osclen-1]) {
+						ostr[osclen-1] = '\0';
+					}
+				} else {
+					oscp = ostr;
+				}
+				ostrcopy = strdup(oscp);
+				if (NULL == ostrcopy) {
+					retVal = RS_SCRIPT_EINVAL;
+					goto bail;
+				}
+				osclen = strlen(ostrcopy);
+				/* 
+				 * Turning the string into a string format json object.  E.g.,
+				 * "{\"message\":\"Test message \",\"log_level\":\"INFO\"}"
+				 * ==>
+				 * {"message":"Test message ","log_level":"INFO"}
+				 */
+				unescapeStr((uchar *)ostrcopy, osclen + 1);
+				struct json_object *const nestedjson = json_tokener_parse_ex(tokener, ostrcopy, osclen);
+				if (NULL == nestedjson) {
+					retVal = RS_SCRIPT_EINVAL;
+					goto bail;
+				}
+				/* Deleting orgnestedjson */
+				json_object_object_del(json, nestedkey);
+				/*
+				 * Note: jsonMerge in runtime/jsonMerge has not implemented
+				 * "checking & handling duplicate names" yet.
+				 * Once implemented, we may want to replace with it.
+				 */
+				/* nestedjson is going to be consumed. */
+				json_object_object_merge(json, nestedjson, 0);
+			}
+		}
+		if ((strlen(origkey) > 0) && (NULL != ostrcopy)) {
+			json_object_object_add(json, origkey, json_object_new_string(ostrcopy));
+		}
+		if (0 == strcasecmp(compact, "true")) {
+			jsonCompact(json);
+		}
+		msgAddJSON(pMsg, (uchar*)container+off, json, 0, 0);
+		retVal = RS_SCRIPT_EOK;
+	}
+bail:
+	free(ostrcopy);
+	wtiSetScriptErrno(pWti, retVal);
+	json_tokener_free(tokener);
+
+finalize_it:
+	ret->datatype = 'N';
+	ret->d.n = retVal;
+
+	if(bMustFree) {
+		free(jsontext);
+	}
+	if(bMustFree2) {
+		free(container);
+	}
+	if(bMustFree3) {
+		free(nestedkey);
+	}
+	if(bMustFree4) {
+		free(origkey);
+	}
+	if(bMustFree5) {
+		free(compact);
+	}
+	varFreeMembers(&srcVal[0]);
+	varFreeMembers(&srcVal[1]);
+	varFreeMembers(&srcVal[2]);
+	varFreeMembers(&srcVal[3]);
+	varFreeMembers(&srcVal[4]);
+}
+
 static void ATTR_NONNULL()
 doFunct_RandomGen(struct cnffunc *__restrict__ const func,
 	struct svar *__restrict__ const ret,
@@ -3568,6 +3730,7 @@ static struct scriptFunct functions[] = {
 	{"parse_time", 1, 1, doFunct_ParseTime, NULL, NULL},
 	{"is_time", 1, 2, doFunct_IsTime, NULL, NULL},
 	{"parse_json", 2, 2, doFunc_parse_json, NULL, NULL},
+	{"parse_json_ex", 5, 5, doFunc_parse_json_ex, NULL, NULL},
 	{"script_error", 0, 0, doFunct_ScriptError, NULL, NULL},
 	{"previous_action_suspended", 0, 0, doFunct_PreviousActionSuspended, NULL, NULL},
 	{NULL, 0, 0, NULL, NULL, NULL} //last element to check end of array
@@ -5548,7 +5711,7 @@ unescapeStr(uchar *s, int len)
 	int iSrc, iDst;
 	assert(s != NULL);
 
-	/* scan for first escape sequence (if we are luky, there is none!) */
+	/* scan for first escape sequence (if we are lucky, there is none!) */
 	iSrc = 0;
 	while(iSrc < len && s[iSrc] != '\\')
 		++iSrc;

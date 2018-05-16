@@ -4816,6 +4816,53 @@ finalize_it:
 	RETiRet;
 }
 
+/* 
+ * Deleting empty json values.  Applicable to string, array, and json object type.
+ * [example]
+ * input:
+ *   {"message":"Test message","log_level":"INFO","field0":"","field1":[],"field2":{}}
+ * output:
+ *   {"message":"Test message","log_level":"INFO"}
+ */
+rsRetVal
+jsonCompact(struct json_object *__restrict__ json)
+{
+	DEFiRet;
+
+	if(json == NULL) {
+		goto finalize_it;
+	}
+
+	struct json_object_iterator it = json_object_iter_begin(json);
+	struct json_object_iterator itEnd = json_object_iter_end(json);
+	while (!json_object_iter_equal(&it, &itEnd)) {
+		struct json_object *val = json_object_iter_peek_value(&it);
+		switch (json_object_get_type(val)) {
+		case json_type_string:
+			if (0 == json_object_get_string_len(val)) {
+				json_object_object_del(json, json_object_iter_peek_name(&it));	
+			}
+			break;
+		case json_type_array:
+			if (0 == json_object_array_length(val)) {
+				json_object_object_del(json, json_object_iter_peek_name(&it));	
+			}
+			break;
+		case json_type_object:
+			if (0 == json_object_object_length(val)) {
+				json_object_object_del(json, json_object_iter_peek_name(&it));	
+			} else {
+				CHKiRet(jsonCompact(val));
+			}
+			break;
+		default: break;
+		}
+		json_object_iter_next(&it);
+	}
+finalize_it:
+	RETiRet;
+}
+
 rsRetVal
 msgAddJSON(smsg_t * const pM, uchar *name, struct json_object *json, int force_reset, int sharedReference)
 {
