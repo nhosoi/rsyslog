@@ -67,6 +67,7 @@ typedef struct _instanceData {
 	sbool bCompact;        /* Skip object if the value is null */
 	char *messageField;    /* Specify field name which value is escaped json string */
 	char *altMessageField; /* Specify alt field name the escaped json string value to be held with */
+	msgPropDescr_t *varDescr;/* name of variable to use */
 	/* REMOVE dummy when real data items are to be added! */
 } instanceData;
 
@@ -89,7 +90,8 @@ static struct cnfparamdescr actpdescr[] = {
 	{ "userawmsg", eCmdHdlrBinary, 0 },
 	{ "compact", eCmdHdlrBinary, 0 },
 	{ "message_field", eCmdHdlrString, 0 },
-	{ "alt_message_field", eCmdHdlrString, 0 }
+	{ "alt_message_field", eCmdHdlrString, 0 },
+	{ "variable", eCmdHdlrString, 0 }
 };
 static struct cnfparamblk actpblk =
 	{ CNFPARAMBLK_VERSION,
@@ -156,6 +158,8 @@ CODESTARTfreeInstance
 	free(pData->container);
 	free(pData->messageField);
 	free(pData->altMessageField);
+	msgPropDescrDestruct(pData->varDescr);
+	free(pData->varDescr);
 ENDfreeInstance
 
 BEGINfreeWrkrInstance
@@ -168,6 +172,13 @@ ENDfreeWrkrInstance
 BEGINdbgPrintInstInfo
 CODESTARTdbgPrintInstInfo
 	DBGPRINTF("mmjsonparse\n");
+	DBGPRINTF("\tcookie='%s'\n", pData->cookie);
+	DBGPRINTF("\tcontainer='%s'\n", pData->container);
+	DBGPRINTF("\tbUseRawMsg='%d'\n", pData->bUseRawMsg);
+	DBGPRINTF("\tmessageField='%s'\n", pData->messageField);
+	DBGPRINTF("\taltMessageField='%s'\n", pData->altMessageField);
+	DBGPRINTF("\tbCompact='%d'\n", pData->bCompact);
+	DBGPRINTF("\tvariable='%s'\n", pData->varDescr->name);
 ENDdbgPrintInstInfo
 
 
@@ -333,16 +344,20 @@ BEGINdoAction_NoStrings
 	struct json_object *jval;
 	struct json_object *json;
 	instanceData *pData;
+	unsigned short freeBuf = 0;
 CODESTARTdoAction
 	pData = pWrkrData->pData;
 	/* note that we can performance-optimize the interface, but this also
 	 * requires changes to the libraries. For now, we accept message
 	 * duplication. -- rgerhards, 2010-12-01
 	 */
-	if(pWrkrData->pData->bUseRawMsg)
+	if(pWrkrData->pData->bUseRawMsg) {
 		getRawMsg(pMsg, &buf, &len);
-	else
+	} else if (pWrkrData->pData->varDescr) {
+		buf = MsgGetProp(pMsg, NULL, pWrkrData->pData->varDescr, &len, &freeBuf, NULL);
+	} else {
 		buf = getMSG(pMsg);
+	}
 
 	while(*buf && isspace(*buf)) {
 		++buf;
@@ -354,6 +369,10 @@ CODESTARTdoAction
 	}
 	buf += pData->lenCookie;
 	CHKiRet(processJSON(pWrkrData, pMsg, (char*) buf, strlen((char*)buf)));
+	if (freeBuf) {
+		free(buf);
+		buf = NULL;
+	}
 	bSuccess = 1;
 finalize_it:
 	if(iRet == RS_RET_NO_CEE_MSG) {
@@ -372,11 +391,15 @@ setInstParamDefaults(instanceData *pData)
 {
 	pData->bUseRawMsg = 0;
 	pData->bCompact = 0;
+	pData->messageField = NULL;
+	pData->altMessageField = NULL;
+	pData->varDescr = NULL;
 }
 
 BEGINnewActInst
 	struct cnfparamvals *pvals;
 	int i;
+	char *varName = NULL;
 CODESTARTnewActInst
 	DBGPRINTF("newActInst (mmjsonparse)\n");
 	if((pvals = nvlstGetParams(lst, &actpblk, NULL)) == NULL) {
@@ -414,10 +437,10 @@ CODESTARTnewActInst
 			           || pData->container[0] == '.'
 			           || pData->container[0] == '/' ) )
 			   ) {
-			parser_errmsg("mmjsonparse: invalid container name '%s', name must "
-				"start with either '$!', '$.', or '$/'", pData->container);
-			ABORT_FINALIZE(RS_RET_INVALID_VAR);
-		}
+				parser_errmsg("mmjsonparse: invalid container name '%s', name must "
+					"start with either '$!', '$.', or '$/'", pData->container);
+				ABORT_FINALIZE(RS_RET_INVALID_VAR);
+			}
 		} else if(!strcmp(actpblk.descr[i].name, "userawmsg")) {
 			pData->bUseRawMsg = (int) pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "compact")) {
@@ -428,9 +451,23 @@ CODESTARTnewActInst
 		} else if(!strcmp(actpblk.descr[i].name, "alt_message_field")) {
 			free(pData->altMessageField);
 			pData->altMessageField = es_str2cstr(pvals[i].val.d.estr, NULL);
+		} else if(!strcmp(actpblk.descr[i].name, "variable")) {
+			varName = es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else {
 			dbgprintf("mmjsonparse: program error, non-handled param '%s'\n", actpblk.descr[i].name);
 		}
+	}
+	if (varName) {
+		if(pData->bUseRawMsg) {
+			errmsg.LogError(0, RS_RET_CONFIG_ERROR,
+							"mmjsonparse: 'variable' param can't be used with 'useRawMsg'. "
+							"Ignoring 'variable', will use raw message.");
+		} else {
+			CHKmalloc(pData->varDescr = MALLOC(sizeof(msgPropDescr_t)));
+			CHKiRet(msgPropDescrFill(pData->varDescr, (uchar*) varName, strlen(varName)));
+		}
+		free(varName);
+		varName = NULL;
 	}
 
 	if(pData->container == NULL)
